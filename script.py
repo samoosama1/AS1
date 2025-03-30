@@ -29,7 +29,7 @@ def hough_transform(edge_image, rho_resolution=0.5, theta_resolution=0.5, thresh
     if num_edge_points > 0:
         np.add.at(hough_space, (rho_bins[valid_mask], theta_indices[valid_mask]), 1)
     max_votes = hough_space.max() if hough_space.max() > 0 else 1
-    threshold = threshold_factor * max_votes  # Changed to use threshold_factor parameter
+    threshold = threshold_factor * max_votes  
     rho_bins, theta_bins = np.where(hough_space >= threshold)
     votes = hough_space[rho_bins, theta_bins]
     rho = (rho_bins * rho_resolution) - max_rho
@@ -39,9 +39,10 @@ def hough_transform(edge_image, rho_resolution=0.5, theta_resolution=0.5, thresh
         peaks = peaks[peaks[:, 2].argsort()[::-1]]
     return peaks
 
-def select_document_lines(lines, img_shape, max_lines=4):
+def select_document_lines(lines, img_shape, max_lines=4, horizontal_threshold=np.pi/12, vertical_threshold=np.pi/12):
     """
-    Select the most significant lines that likely represent document boundaries.
+    Select the most significant lines that likely represent document boundaries,
+    prioritizing near-horizontal and near-vertical lines.
     
     Parameters:
     -----------
@@ -51,6 +52,10 @@ def select_document_lines(lines, img_shape, max_lines=4):
         (height, width) of the image
     max_lines : int
         Number of lines to return (typically 4 for a document)
+    horizontal_threshold : float
+        Angle threshold in radians to consider a line as horizontal (from 0 or pi)
+    vertical_threshold : float
+        Angle threshold in radians to consider a line as vertical (from pi/2)
         
     Returns:
     --------
@@ -65,57 +70,173 @@ def select_document_lines(lines, img_shape, max_lines=4):
         # If votes are missing, add dummy votes
         lines = np.column_stack((lines, np.ones(len(lines))))
     
-    # Step 1: Cluster lines with similar angle
-    angle_threshold = np.pi / 36  # 5 degrees
-    distance_threshold = min(img_shape) * 0.02  # 2% of image dimension
-    
-    # Sort by votes (importance)
-    lines = lines[lines[:, 2].argsort()[::-1]]
-    
-    # Initialize clusters
-    clusters = []
-    
-    for line in lines:
+    # Normalize all theta values to range [0, pi)
+    normalized_lines = lines.copy()
+    for i, line in enumerate(normalized_lines):
         rho, theta, votes = line
-        
-        # Normalize theta to range [-pi/2, pi/2)
         theta = theta % np.pi
-        if theta >= np.pi/2:
+        if theta >= np.pi:
             theta -= np.pi
             rho = -rho
+        normalized_lines[i] = [rho, theta, votes]
+    
+    # Define vertical and horizontal angle ranges
+    vertical_mask = ((normalized_lines[:, 1] > (np.pi/2 - vertical_threshold)) & 
+                     (normalized_lines[:, 1] < (np.pi/2 + vertical_threshold)))
+    
+    horizontal_mask = ((normalized_lines[:, 1] < horizontal_threshold) | 
+                       (normalized_lines[:, 1] > (np.pi - horizontal_threshold)))
+    
+    # Split lines into vertical, horizontal, and other
+    vertical_lines = normalized_lines[vertical_mask]
+    horizontal_lines = normalized_lines[horizontal_mask]
+    other_lines = normalized_lines[~(vertical_mask | horizontal_mask)]
+    
+    # Sort each group by votes (importance)
+    if len(vertical_lines) > 0:
+        vertical_lines = vertical_lines[vertical_lines[:, 2].argsort()[::-1]]
+    if len(horizontal_lines) > 0:
+        horizontal_lines = horizontal_lines[horizontal_lines[:, 2].argsort()[::-1]]
+    if len(other_lines) > 0:
+        other_lines = other_lines[other_lines[:, 2].argsort()[::-1]]
+    
+    # Cluster similar lines to avoid duplicates
+    angle_threshold = np.pi / 36  # 5 degrees
+    distance_threshold = min(img_shape) * 0.05  # 5% of image dimension
+    
+    # Function to cluster lines within a group
+    def cluster_lines(group_lines):
+        if len(group_lines) == 0:
+            return []
             
-        assigned = False
-        
-        # Check if line fits in any existing cluster
-        for i, cluster in enumerate(clusters):
-            cluster_theta = cluster[0][1]
+        clusters = []
+        for line in group_lines:
+            rho, theta, votes = line
+            assigned = False
             
-            # If angle is similar
-            if abs(theta - cluster_theta) < angle_threshold or abs(abs(theta - cluster_theta) - np.pi) < angle_threshold:
-                # If distance is similar (for parallel lines)
-                if abs(rho - cluster[0][0]) < distance_threshold:
-                    clusters[i].append((rho, theta, votes))
-                    assigned = True
-                    break
+            for i, cluster in enumerate(clusters):
+                cluster_theta = cluster[0][1]
+                
+                # If angle is similar
+                if abs(theta - cluster_theta) < angle_threshold:
+                    # If distance is similar (for parallel lines)
+                    distance_diff = abs(rho - cluster[0][0])
+                    if distance_diff < distance_threshold:
+                        clusters[i].append((rho, theta, votes))
+                        assigned = True
+                        break
+            
+            # If line doesn't fit any cluster, create a new one
+            if not assigned:
+                clusters.append([(rho, theta, votes)])
         
-        # If line doesn't fit any cluster, create a new one
-        if not assigned:
-            clusters.append([(rho, theta, votes)])
+        # Select the strongest line from each cluster
+        selected = []
+        for cluster in clusters:
+            # Sort by votes and take the one with highest votes
+            cluster.sort(key=lambda x: x[2], reverse=True)
+            selected.append(cluster[0])
+            
+        return selected
     
-    # Step 2: Select the strongest line from each cluster
-    selected_lines = []
-    for cluster in clusters:
-        # Sort by votes and take the one with highest votes
-        cluster.sort(key=lambda x: x[2], reverse=True)
-        selected_lines.append(cluster[0])
+    # Cluster each group
+    selected_vertical = cluster_lines(vertical_lines)
+    selected_horizontal = cluster_lines(horizontal_lines)
+    selected_other = cluster_lines(other_lines)
     
-    # Step 3: Select the most important lines (typically 4 for a document)
-    # Sort by votes and take top max_lines
-    selected_lines.sort(key=lambda x: x[2], reverse=True)
-    selected_lines = selected_lines[:max_lines]
+    # Determine how many lines to select from each group
+    # Prioritize vertical and horizontal lines
+    n_vertical = min(len(selected_vertical), max_lines // 2)
+    n_horizontal = min(len(selected_horizontal), max_lines // 2)
     
-    # Convert back to numpy array
-    return np.array(selected_lines)
+    # If we still need more lines, fill with other lines
+    remaining_slots = max_lines - (n_vertical + n_horizontal)
+    n_other = min(len(selected_other), remaining_slots) if remaining_slots > 0 else 0
+    
+    # Take the top n from each group
+    final_vertical = selected_vertical[:n_vertical]
+    final_horizontal = selected_horizontal[:n_horizontal]
+    final_other = selected_other[:n_other]
+    
+    # Combine and convert to numpy array
+    all_selected = final_vertical + final_horizontal + final_other
+    
+    # If we don't have enough lines, relax our criteria and include more from other categories
+    if len(all_selected) < max_lines:
+        remaining = max_lines - len(all_selected)
+        
+        # First try to add more vertical lines
+        if n_vertical < len(selected_vertical):
+            additional_vertical = min(len(selected_vertical) - n_vertical, remaining)
+            all_selected.extend(selected_vertical[n_vertical:n_vertical + additional_vertical])
+            remaining -= additional_vertical
+        
+        # Then try horizontal
+        if remaining > 0 and n_horizontal < len(selected_horizontal):
+            additional_horizontal = min(len(selected_horizontal) - n_horizontal, remaining)
+            all_selected.extend(selected_horizontal[n_horizontal:n_horizontal + additional_horizontal])
+            remaining -= additional_horizontal
+        
+        # Finally other lines
+        if remaining > 0 and n_other < len(selected_other):
+            additional_other = min(len(selected_other) - n_other, remaining)
+            all_selected.extend(selected_other[n_other:n_other + additional_other])
+    
+    # Sort all selected lines by votes for final ranking
+        all_selected.sort(key=lambda x: x[2], reverse=True)
+    
+    # Convert to numpy array 
+        return np.array(all_selected)
+  # 5% of image dimension
+
+# C uster each group
+    selected_vertical = cluster_lines(vertical_lines)
+    selected_horizontal = cluster_lines(horizontal_lines)
+    selected_other = cluster_lines(other_lines)
+
+    # Determine how many lines to select from each group
+    # Prioritize vertical and horizontal lines
+    n_vertical = min(len(selected_vertical), max_lines // 2)
+    n_horizontal = min(len(selected_horizontal), max_lines // 2)
+
+    # If we still need more lines, fill with other lines
+    remaining_slots = max_lines - (n_vertical + n_horizontal)
+    n_other = min(len(selected_other), remaining_slots) if remaining_slots > 0 else 0
+
+    # Take the top n from each group
+    final_vertical = selected_vertical[:n_vertical]
+    final_horizontal = selected_horizontal[:n_horizontal]
+    final_other = selected_other[:n_other]
+
+    # Combine and convert to numpy array
+    all_selected = final_vertical + final_horizontal + final_other
+
+    # If we don't have enough lines, relax our criteria and include more from other categories
+    if len(all_selected) < max_lines:
+        remaining = max_lines - len(all_selected)
+
+        # First try to add more vertical lines
+        if n_vertical < len(selected_vertical):
+            additional_vertical = min(len(selected_vertical) - n_vertical, remaining)
+            all_selected.extend(selected_vertical[n_vertical:n_vertical + additional_vertical])
+            remaining -= additional_vertical
+
+        # Then try horizontal
+        if remaining > 0 and n_horizontal < len(selected_horizontal):
+            additional_horizontal = min(len(selected_horizontal) - n_horizontal, remaining)
+            all_selected.extend(selected_horizontal[n_horizontal:n_horizontal + additional_horizontal])
+            remaining -= additional_horizontal
+
+        # Finally other lines
+        if remaining > 0 and n_other < len(selected_other):
+            additional_other = min(len(selected_other) - n_other, remaining)
+            all_selected.extend(selected_other[n_other:n_other + additional_other])
+
+    # Sort all selected lines by votes for final ranking
+    all_selected.sort(key=lambda x: x[2], reverse=True)
+
+    # Convert to numpy array 
+    return np.array(all_selected)   
 
 def calculate_intersections(lines):
     """
@@ -279,6 +400,9 @@ def process_document_image(image_path, output_dir='outputs', resize_factor=0.4):
     """
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(f"{output_dir}/edges", exist_ok=True)
+    os.makedirs(f"{output_dir}/lines", exist_ok=True)
+    os.makedirs(f"{output_dir}/warped", exist_ok=True)
     
     # Extract image number from path
     img_name = os.path.basename(image_path)
@@ -295,27 +419,36 @@ def process_document_image(image_path, output_dir='outputs', resize_factor=0.4):
     contrast_image = clahe.apply(image)
     
     # Apply Gaussian blur with smaller kernel
-    blurred = cv2.GaussianBlur(contrast_image, (5, 5), 1.5)
+    blurred = cv2.GaussianBlur(image, (21, 21), 5)
     
     # Resize for faster processing
-    resized_image = cv2.resize(blurred, (int(image.shape[1] * resize_factor), 
-                                          int(image.shape[0] * resize_factor)), 
-                                interpolation=cv2.INTER_LINEAR)
+    resized_image = cv2.resize(blurred, (1024, 1024), interpolation=cv2.INTER_LINEAR)
     
     # Edge detection with tighter thresholds
     edges = cv2.Canny(resized_image, threshold1=50, threshold2=150)
     
     # Save edges image
-    edges_path = f"{output_dir}/edges_{img_num}.jpg"
+    edges_path = f"{output_dir}/edges/{img_num}.jpg"
+    os.makedirs(os.path.dirname(edges_path), exist_ok=True)
     cv2.imwrite(edges_path, edges)
     
     # Hough transform with finer resolution
-    lines = hough_transform(edges, rho_resolution=0.5, theta_resolution=0.5, threshold_factor=0.3)
+    lines = hough_transform(edges, rho_resolution=0.5, theta_resolution=0.5, threshold_factor=0.5)
     
     print(f"Image {img_num}: Detected {len(lines)} lines")
     
-    # Select document boundary lines
-    selected_lines = select_document_lines(lines, edges.shape, max_lines=8)
+    # Select document boundary lines with angle-based filtering
+    # Define thresholds for near-horizontal and near-vertical lines (15 degrees)
+    horizontal_threshold = np.pi/12  # 15 degrees from horizontal
+    vertical_threshold = np.pi/12    # 15 degrees from vertical
+    
+    selected_lines = select_document_lines(
+        lines, 
+        edges.shape, 
+        max_lines=8,
+        horizontal_threshold=horizontal_threshold, 
+        vertical_threshold=vertical_threshold
+    )
     
     # Calculate intersections between lines
     intersections = calculate_intersections(selected_lines)
@@ -344,7 +477,16 @@ def process_document_image(image_path, output_dir='outputs', resize_factor=0.4):
         x2 = int(x0 - 1000 * (-b))
         y2 = int(y0 - 1000 * (a))
         
-        cv2.line(resized_image_bgr, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        # Color horizontal lines in blue, vertical in green, others in red
+        color = (0, 0, 255)  # Default red for others
+        norm_theta = theta % np.pi
+        
+        if norm_theta < horizontal_threshold or norm_theta > (np.pi - horizontal_threshold):
+            color = (255, 0, 0)  # Blue for horizontal
+        elif np.abs(norm_theta - np.pi/2) < vertical_threshold:
+            color = (0, 255, 0)  # Green for vertical
+            
+        cv2.line(resized_image_bgr, (x1, y1), (x2, y2), color, 2)
     
     # Draw corners if found
     if corners is not None:
@@ -360,7 +502,8 @@ def process_document_image(image_path, output_dir='outputs', resize_factor=0.4):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
     
     # Save visualization
-    lines_path = f"{output_dir}/lines_{img_num}.jpg"
+    lines_path = f"{output_dir}/lines/{img_num}.jpg"
+    os.makedirs(os.path.dirname(lines_path), exist_ok=True)
     cv2.imwrite(lines_path, resized_image_bgr)
     
     # Rectify document if corners found
@@ -406,7 +549,8 @@ def process_document_image(image_path, output_dir='outputs', resize_factor=0.4):
         warped = cv2.warpPerspective(image, M, (w, h))
         
         # Save warped image
-        warped_path = f"{output_dir}/warped_{img_num}.jpg"
+        warped_path = f"{output_dir}/warped/{img_num}.jpg"
+        os.makedirs(os.path.dirname(warped_path), exist_ok=True)
         cv2.imwrite(warped_path, warped)
     
     return {
@@ -417,28 +561,29 @@ def process_document_image(image_path, output_dir='outputs', resize_factor=0.4):
         "corners_found": corners is not None
     }
 
+
 # Main execution
 if __name__ == "__main__":
     # Check if inputs directory provided as argument
-    input_dir = sys.argv[1] if len(sys.argv) > 1 else "WarpDoc/distorted/curved"
-    output_dir = "outputs"
-    
-    # Create outputs directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Process images in the input directory
-    image_files = list(Path(input_dir).glob("*.jpg"))
-    
-    results = []
-    for img_path in image_files:
-        print(f"Processing {img_path}")
-        result = process_document_image(str(img_path), output_dir)
-        results.append((img_path, result))
-    
-    # Print summary
-    print("\nProcessing Summary:")
-    print("-" * 50)
-    for img_path, result in results:
-        status = "Success" if result["success"] else "Failed"
-        corners = "Found" if result.get("corners_found", False) else "Not found"
-        print(f"{img_path}: {status}, Corners: {corners}")
+    input_dirs = ["WarpDoc/distorted/curved","WarpDoc/distorted/fold","WarpDoc/distorted/incomplete","WarpDoc/distorted/perspective", "WarpDoc/distorted/random", "WarpDoc/distorted/rotate"]
+    output_dirs = ["outputs/curved", "outputs/fold", "outputs/incomplete", "outputs/perspective", "outputs/random", "outputs/random"]
+    for input_dir, output_dir in zip(input_dirs, output_dirs):
+        # Create outputs directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Process images in the input directory
+        image_files = list(Path(input_dir).glob("*.jpg"))
+
+        results = []
+        for img_path in image_files:
+            print(f"Processing {img_path}")
+            result = process_document_image(str(img_path), output_dir, resize_factor=0.5)
+            results.append((img_path, result))
+
+        # Print summary
+        print("\nProcessing Summary:")
+        print("-" * 50)
+        for img_path, result in results:
+            status = "Success" if result["success"] else "Failed"
+            corners = "Found" if result.get("corners_found", False) else "Not found"
+            print(f"{img_path}: {status}, Corners: {corners}")
