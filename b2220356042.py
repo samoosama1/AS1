@@ -1,3 +1,8 @@
+# %% [markdown]
+# Abdussamet Tekin 2220356042
+
+# %%
+# Import necessary libraries
 import sys
 import numpy as np
 import cv2
@@ -6,39 +11,90 @@ from skimage.metrics import structural_similarity as ssim
 import os
 from pathlib import Path
 
-def hough_transform(edge_image, rho_resolution=0.5, theta_resolution=0.5, threshold_factor=0.3):
-    height, width = edge_image.shape 
-    num_theta_bins = int(180 / theta_resolution)
-    theta_values = np.arange(0, 180, theta_resolution)
-    theta_radians = theta_values * (np.pi / 180)
-    diagonal = np.sqrt(height**2 + width**2)
-    max_rho = diagonal
-    num_rho_bins = int(2 * diagonal / rho_resolution)
-    hough_space = np.zeros((num_rho_bins, num_theta_bins))
-    cos_theta = np.cos(theta_radians)
-    sin_theta = np.sin(theta_radians)
-    y, x = np.nonzero(edge_image)
-    num_edge_points = len(x)
-    x_adjusted = x - (width / 2)
-    y_adjusted = y - (height / 2)
-    rho = x_adjusted[:, np.newaxis] * cos_theta[np.newaxis, :] + y_adjusted[:, np.newaxis] * sin_theta[np.newaxis, :]
-    rho_bins = ((rho + max_rho) / rho_resolution).astype(int)
-    valid_mask = (rho_bins >= 0) & (rho_bins < num_rho_bins)
-    theta_indices = np.arange(num_theta_bins)[np.newaxis, :]
-    theta_indices = np.repeat(theta_indices, num_edge_points, axis=0)
-    if num_edge_points > 0:
-        np.add.at(hough_space, (rho_bins[valid_mask], theta_indices[valid_mask]), 1)
-    max_votes = hough_space.max() if hough_space.max() > 0 else 1
-    threshold = threshold_factor * max_votes  
-    rho_bins, theta_bins = np.where(hough_space >= threshold)
-    votes = hough_space[rho_bins, theta_bins]
-    rho = (rho_bins * rho_resolution) - max_rho
-    theta = (theta_bins * theta_resolution) * (np.pi / 180)
-    peaks = np.column_stack((rho, theta, votes))
-    if len(peaks) > 0:
-        peaks = peaks[peaks[:, 2].argsort()[::-1]]
-    return peaks
 
+# %% [markdown]
+# First we implement the Hough Transform from scratch using numpy.
+
+# %%
+def hough_transform(edge_image, rho_resolution=0.5, theta_resolution=0.5, threshold_factor=0.3):
+   # Get dimensions of the input edge image
+   height, width = edge_image.shape 
+   
+   # Calculate number of theta bins and create theta values array
+   num_theta_bins = int(180 / theta_resolution)
+   theta_values = np.arange(0, 180, theta_resolution)
+   # Convert theta values from degrees to radians
+   theta_radians = theta_values * (np.pi / 180)
+   
+   # Calculate the diagonal length of the image (maximum possible distance)
+   diagonal = np.sqrt(height**2 + width**2)
+   max_rho = diagonal
+   
+   # Calculate number of rho bins
+   num_rho_bins = int(2 * diagonal / rho_resolution)
+   
+   # Initialize Hough accumulator array (votes for each rho-theta pair)
+   hough_space = np.zeros((num_rho_bins, num_theta_bins))
+   
+   # Pre-compute cosine and sine values for efficiency
+   cos_theta = np.cos(theta_radians)
+   sin_theta = np.sin(theta_radians)
+   
+   # Find coordinates of non-zero pixels (edge points)
+   y, x = np.nonzero(edge_image)
+   num_edge_points = len(x)
+   
+   # Adjust coordinates relative to center of image
+   x_adjusted = x - (width / 2)
+   y_adjusted = y - (height / 2)
+   
+   # Calculate rho values for all edge points across all theta values
+   rho = x_adjusted[:, np.newaxis] * cos_theta[np.newaxis, :] + y_adjusted[:, np.newaxis] * sin_theta[np.newaxis, :]
+   
+   # Convert rho values to bin indices
+   rho_bins = ((rho + max_rho) / rho_resolution).astype(int)
+   
+   # Create mask for valid bin indices (within bounds)
+   valid_mask = (rho_bins >= 0) & (rho_bins < num_rho_bins)
+   
+   # Create array of theta indices and repeat for each edge point
+   theta_indices = np.arange(num_theta_bins)[np.newaxis, :]
+   theta_indices = np.repeat(theta_indices, num_edge_points, axis=0)
+   
+   # Increment Hough accumulator for valid points
+   if num_edge_points > 0:
+       np.add.at(hough_space, (rho_bins[valid_mask], theta_indices[valid_mask]), 1)
+   
+   # Find maximum vote count (handle empty case)
+   max_votes = hough_space.max() if hough_space.max() > 0 else 1
+   
+   # Calculate threshold based on maximum votes
+   threshold = threshold_factor * max_votes  
+   
+   # Find coordinates of bins that exceed threshold
+   rho_bins, theta_bins = np.where(hough_space >= threshold)
+   
+   # Get vote counts for the identified peaks
+   votes = hough_space[rho_bins, theta_bins]
+   
+   # Convert bin indices back to rho and theta values
+   rho = (rho_bins * rho_resolution) - max_rho
+   theta = (theta_bins * theta_resolution) * (np.pi / 180)
+   
+   # Combine rho, theta, and vote counts
+   peaks = np.column_stack((rho, theta, votes))
+   
+   # Sort peaks by vote count in descending order
+   if len(peaks) > 0:
+       peaks = peaks[peaks[:, 2].argsort()[::-1]]
+       
+   # Return the peaks array (rho, theta, votes)
+   return peaks
+
+# %% [markdown]
+# When the Hough Transform fits lines, we use this select_document_lines function to select the lines that are most likely to be document lines.
+
+# %%
 def select_document_lines(lines, img_shape, max_lines=4, horizontal_threshold=np.pi/12, vertical_threshold=np.pi/12):
     """
     Select the most significant lines that likely represent document boundaries,
@@ -236,8 +292,12 @@ def select_document_lines(lines, img_shape, max_lines=4, horizontal_threshold=np
     all_selected.sort(key=lambda x: x[2], reverse=True)
 
     # Convert to numpy array 
-    return np.array(all_selected)   
+    return np.array(all_selected)
 
+# %% [markdown]
+# Then from these selected lines, we calculate the intersection points of these lines in order to detect document corners.
+
+# %%
 def calculate_intersections(lines):
     """
     Calculate all intersection points between lines.
@@ -277,6 +337,10 @@ def calculate_intersections(lines):
     
     return intersections
 
+# %% [markdown]
+# Using these intersection points, we find the document corners so that we can apply perspective transform to dewarp the document.
+
+# %%
 def find_document_corners(intersections, img_shape):
     """
     Find the four corners of the document from all intersections.
@@ -345,6 +409,10 @@ def find_document_corners(intersections, img_shape):
     # Order corners (top-left, top-right, bottom-right, bottom-left)
     return order_points(corners)
 
+# %% [markdown]
+# Then we order these points in a clockwise manner so we can use them for perspective transformation. The reason the ordering helps with the transformation is that it ensures the points are in the correct order for the transformation matrix to be calculated correctly.  
+
+# %%
 def order_points(pts):
     """
     Order points in clockwise order starting from top-left.
@@ -380,6 +448,20 @@ def order_points(pts):
     
     return rect
 
+# %% [markdown]
+# This process_document_image function is the main function that will be called to process the image. If will take the image path as input and return the corners of the document. The workflow is as follows: 
+# 1. Read the image and convert it to grayscale.
+# 2. Apply Gaussian blur to reduce noise.
+# 3. Detect edges using Canny edge detection.
+# 4. Perform Hough Transform to detect lines.
+# 5. Select the most significant lines that likely represent document boundaries.
+# 6. Calculate intersections of the selected lines.
+# 7. Find the four corners of the document from the intersections.
+# 8. Return the corners of the document.
+# 9. Rectify the image using the corners.
+# 10. Write the rectified image to the output path.
+
+# %%
 def process_document_image(image_path, output_dir='outputs', resize_factor=0.4):
     """
     Process a document image to detect edges and rectify.
@@ -561,8 +643,10 @@ def process_document_image(image_path, output_dir='outputs', resize_factor=0.4):
         "corners_found": corners is not None
     }
 
+# %% [markdown]
+# This part is for testing the function with a directory of images and saving the results in a specified output directory. It can be run as a script to process all images in the input directory. The function process_document_image is called for each image, and the results are saved in the output directory. The function also prints a summary of the processing results.
 
-# Main execution
+# %%
 if __name__ == "__main__":
     # Check if inputs directory provided as argument
     input_dirs = ["WarpDoc/distorted/curved","WarpDoc/distorted/fold","WarpDoc/distorted/incomplete","WarpDoc/distorted/perspective", "WarpDoc/distorted/random", "WarpDoc/distorted/rotate"]
@@ -587,3 +671,9 @@ if __name__ == "__main__":
             status = "Success" if result["success"] else "Failed"
             corners = "Found" if result.get("corners_found", False) else "Not found"
             print(f"{img_path}: {status}, Corners: {corners}")
+
+# %%
+
+
+
+
